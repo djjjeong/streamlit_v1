@@ -1,8 +1,8 @@
-# app.py — 단일 파일 버전 (개선안 B: 행동 시퀀스 초점)
 import json
 from math import sqrt
 from datetime import datetime
 from dateutil import tz
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -57,7 +57,7 @@ def parse_mixpanel_csv(file) -> pd.DataFrame:
     # 타임스탬프
     out["ts"] = pd.to_datetime(pd.to_numeric(out["time"], errors="coerce"), unit="s", errors="coerce", utc=True)
     # 정렬
-    out = out.sort_values(["distinct_id","ts"])
+    out = out.sort_values(["distinct_id","ts"]) 
     # 다음 이벤트 시각
     out["next_ts"] = out.groupby("distinct_id")["ts"].shift(-1)
     # dwell(추정): 다음 이벤트까지의 간격을 0~600초로 클립
@@ -72,17 +72,34 @@ def parse_mixpanel_csv(file) -> pd.DataFrame:
     return out
 
 # ---------------------------
-# 입력: 파일 업로드 (단일 파일로 운영)
+# 입력: 기본 CSV 자동 로드 (+선택적 업로드)
 # ---------------------------
 st.markdown("## 인증서 상세페이지 · SNS 공유 인사이트 (행동 시퀀스 초점)")
 st.caption("CSV 스키마 예: event, distinct_id, time, properties_json (Mixpanel Export)")
 
-uploaded = st.file_uploader("mixpanel_raw.csv 업로드", type=["csv"])
-if not uploaded:
-    st.info("CSV를 업로드하면 대시보드가 생성됩니다.")
-    st.stop()
+DEFAULT_PATH = Path("/mnt/data/mixpanel_raw.csv")  # 첨부된 기본 CSV 경로
 
-df = parse_mixpanel_csv(uploaded)
+def _try_load_default():
+    if DEFAULT_PATH.exists():
+        try:
+            return parse_mixpanel_csv(DEFAULT_PATH)
+        except Exception as e:
+            st.warning(f"기본 CSV 로드 실패: {e}")
+    return None
+
+# 데이터 소스 선택(자동)
+_autoload_df = _try_load_default()
+show_uploader = st.toggle("수동 업로드 사용", value=False if _autoload_df is not None else True, help="기본 CSV가 있을 경우 자동 로드를 사용합니다.")
+
+if not show_uploader and _autoload_df is not None:
+    st.success(f"기본 CSV 자동 로드 완료 · 경로: {DEFAULT_PATH}")
+    df = _autoload_df
+else:
+    uploaded = st.file_uploader("mixpanel_raw.csv 업로드", type=["csv"]) 
+    if not uploaded:
+        st.info("기본 CSV가 없거나 업로드를 선택하셨습니다. 파일을 업로드하면 대시보드가 생성됩니다.")
+        st.stop()
+    df = parse_mixpanel_csv(uploaded)
 
 # ---------------------------
 # 사이드바 필터
@@ -188,7 +205,9 @@ st.caption("굵을수록 많이 발생한 경로. 노드/링크 hover로 전환 
 # ---------------------------
 st.markdown("<div class='block-title'>2) 체류시간(추정) 분포: Sharers vs Non-sharers</div>", unsafe_allow_html=True)
 sharer_ids = set(f.loc[f["event"]=="Actual SNS Share","distinct_id"].unique().tolist())
-pv = f[f["event"]=="Achievement Page View"][["distinct_id","dwell_sec"]].copy()
+pv = f[f["event"]=="Achievement Page View"]["distinct_id"].to_frame().join(
+    f[f["event"]=="Achievement Page View"]["dwell_sec"].reset_index(drop=True)
+)
 pv["group"] = pv["distinct_id"].apply(lambda x: "Sharers" if x in sharer_ids else "Non-sharers")
 fig_violin = px.violin(pv, x="group", y="dwell_sec", box=True, points="all",
                        color="group", color_discrete_sequence=["#00A6A6","#9CA3AF"])
@@ -220,9 +239,9 @@ plats = sorted(set(open_by.index).union(set(comp_by.index)))
 rows=[]
 for p_name in plats:
     o = int(open_by.get(p_name,0)); c = int(comp_by.get(p_name,0))
-    cvr = c/o if o>0 else 0.0
+    _cvr = c/o if o>0 else 0.0
     lo, hi = wilson_ci(c, o) if o>0 else (0.0,0.0)
-    rows.append({"sns_type":p_name,"open":o,"complete":c,"CVR":cvr,"CI_low":lo,"CI_high":hi})
+    rows.append({"sns_type":p_name,"open":o,"complete":c,"CVR":_cvr,"CI_low":lo,"CI_high":hi})
 cvr_df = pd.DataFrame(rows).sort_values("CVR", ascending=False)
 
 fig_cvr = go.Figure()
