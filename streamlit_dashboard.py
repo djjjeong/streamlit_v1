@@ -1,217 +1,253 @@
-import streamlit as st
+# app.py — 단일 파일 버전 (개선안 B: 행동 시퀀스 초점)
+import json
+from math import sqrt
+from datetime import datetime
+from dateutil import tz
+
+import numpy as np
+import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 
-st.set_page_config(page_title="엑셀 시트별 대시보드", layout="wide")
+# ---------------------------
+# 페이지 설정 & 임베디드 CSS (브랜드 스타일)
+# ---------------------------
+st.set_page_config(page_title="SNS 공유 인사이트 (행동 시퀀스)", layout="wide", page_icon="📈")
 
-# -----------------------------
-# 공통 유틸
-# -----------------------------
-def moving_average(data, window_size):
-    out = []
-    for i in range(len(data)):
-        if i < window_size - 1:
-            out.append(None)
-        else:
-            out.append(sum(data[i - window_size + 1:i + 1]) / window_size)
+BRAND_CSS = """
+:root{
+  --accent:#00A6A6; --danger:#FF6B6B; --ink:#1F2937; --muted:#6B7280; --bg:#FAFAFA;
+}
+html, body { background: var(--bg); }
+.block-title { font-size:18px; font-weight:800; margin:4px 0 12px; color:var(--ink); }
+.kpi { font-size:42px; font-weight:900; color:var(--accent); line-height:1; }
+.kpi-sub { color:var(--muted); font-size:13px; }
+.badge { display:inline-block; padding:6px 10px; border-radius:999px; font-size:12px; font-weight:700; letter-spacing:.2px; margin-right:8px; }
+.badge-danger { background:#FFE4E1; color:var(--danger); border:1px solid #FFC4BE; }
+.badge-ok { background:#DFF5F5; color:var(--accent); border:1px solid #BFECEC; }
+.card { border:1px solid #eaeaea; border-radius:16px; padding:18px; background:#fff; box-shadow:0 2px 18px rgba(0,0,0,.04); }
+.small { font-size:12px; color:var(--muted); }
+hr.soft { border:none; height:1px; background:#efefef; margin:12px 0; }
+"""
+st.markdown(f"<style>{BRAND_CSS}</style>", unsafe_allow_html=True)
+
+# ---------------------------
+# 유틸
+# ---------------------------
+def wilson_ci(success:int, total:int, z:float=1.96):
+    """Binomial proportion 95% CI (Wilson)."""
+    if total <= 0:
+        return (0.0, 0.0)
+    p = success / total
+    denom = 1 + (z**2)/total
+    center = (p + (z**2)/(2*total)) / denom
+    margin = (z/denom) * sqrt((p*(1-p)/total) + (z**2)/(4*total**2))
+    return (max(0.0, center - margin), min(1.0, center + margin))
+
+@st.cache_data(show_spinner=False)
+def parse_mixpanel_csv(file) -> pd.DataFrame:
+    """(event, distinct_id, time, properties_json) CSV → 확장/정규화 + dwell_sec 계산"""
+    df = pd.read_csv(file)
+    # properties_json 파싱
+    props = df["properties_json"].apply(lambda x: json.loads(x) if isinstance(x,str) else {})
+    props_df = pd.json_normalize(props)
+    out = pd.concat([df[["event","distinct_id","time"]], props_df], axis=1)
+    out = out.loc[:, ~out.columns.duplicated()]  # 중복 컬럼 제거
+    # 타임스탬프
+    out["ts"] = pd.to_datetime(pd.to_numeric(out["time"], errors="coerce"), unit="s", errors="coerce", utc=True)
+    # 정렬
+    out = out.sort_values(["distinct_id","ts"])
+    # 다음 이벤트 시각
+    out["next_ts"] = out.groupby("distinct_id")["ts"].shift(-1)
+    # dwell(추정): 다음 이벤트까지의 간격을 0~600초로 클립
+    out["dwell_sec"] = (out["next_ts"] - out["ts"]).dt.total_seconds().clip(lower=0, upper=600)
+    # sns_type 정규화
+    out["sns_type"] = out.get("sns_type", "unknown")
+    out["sns_type"] = out["sns_type"].fillna("unknown").astype(str).str.strip().str.lower()
+    # 디바이스/브라우저/OS(있으면)
+    for c in ["$device", "$browser", "$os"]:
+        if c in out.columns:
+            out[c] = out[c].astype(str)
     return out
 
-# -----------------------------
-# 바차트_히스토그램 대시보드
-# -----------------------------
-def show_bar_histogram_dashboard():
-    labels = ["2023-01", "2023-02", "2023-03", "2023-04", "2023-05", "2023-06", "2023-07", "2023-08", "2023-09", "2023-10", "2023-11", "2023-12"]
-    sales = [885, 918, 887, 1148, 1436, 1205, 1322, 1287, 1398, 1510, 1450, 1600]
+# ---------------------------
+# 입력: 파일 업로드 (단일 파일로 운영)
+# ---------------------------
+st.markdown("## 인증서 상세페이지 · SNS 공유 인사이트 (행동 시퀀스 초점)")
+st.caption("CSV 스키마 예: event, distinct_id, time, properties_json (Mixpanel Export)")
 
-    pct_change = [0] + [round((sales[i] - sales[i-1]) / sales[i-1] * 100, 1) for i in range(1, len(sales))]
-    ma3 = moving_average(sales, 3)
+uploaded = st.file_uploader("mixpanel_raw.csv 업로드", type=["csv"])
+if not uploaded:
+    st.info("CSV를 업로드하면 대시보드가 생성됩니다.")
+    st.stop()
 
-    st.subheader("① 세로 막대형 바차트")
-    colors = ["gray"] + ["steelblue" if sales[i] >= sales[i-1] else "tomato" for i in range(1, len(sales))]
-    fig_bar = go.Figure([go.Bar(x=labels, y=sales, marker_color=colors)])
-    fig_bar.update_layout(xaxis_title="월", yaxis_title="총 매출")
-    st.plotly_chart(fig_bar, use_container_width=True)
+df = parse_mixpanel_csv(uploaded)
 
-    st.subheader("② 꺾은선+막대 혼합 차트")
-    fig_combo = go.Figure()
-    fig_combo.add_trace(go.Bar(x=labels, y=sales, name="총 매출", marker_color="lightblue", yaxis="y"))
-    fig_combo.add_trace(go.Scatter(x=labels, y=pct_change, name="전월 대비 % 변화", mode="lines+markers", marker_color="orange", yaxis="y2"))
-    fig_combo.update_layout(yaxis=dict(title="총 매출"), yaxis2=dict(title="% 변화", overlaying="y", side="right"))
-    st.plotly_chart(fig_combo, use_container_width=True)
+# ---------------------------
+# 사이드바 필터
+# ---------------------------
+st.sidebar.markdown("### 필터")
+min_ts, max_ts = df["ts"].min(), df["ts"].max()
+start, end = st.sidebar.date_input(
+    "기간",
+    value=(min_ts.date() if pd.notna(min_ts) else None,
+           max_ts.date() if pd.notna(max_ts) else None)
+)
+platforms = sorted(df["sns_type"].dropna().unique().tolist())
+sel_platforms = st.sidebar.multiselect("sns_type", platforms, default=platforms)
 
-    st.subheader("③ 이동평균선 시계열 그래프")
-    fig_ma = go.Figure()
-    fig_ma.add_trace(go.Scatter(x=labels, y=sales, mode="lines+markers", name="원본 매출"))
-    fig_ma.add_trace(go.Scatter(x=labels, y=ma3, mode="lines+markers", name="3개월 이동평균"))
-    fig_ma.update_layout(xaxis_title="월", yaxis_title="매출")
-    st.plotly_chart(fig_ma, use_container_width=True)
+extra_filters = {}
+if "$device" in df.columns:
+    devices = sorted(df["$device"].dropna().unique().tolist())[:50]
+    extra_filters["$device"] = st.sidebar.multiselect("Device (선택적)", devices, default=devices)
+if "$browser" in df.columns:
+    browsers = sorted(df["$browser"].dropna().unique().tolist())[:50]
+    extra_filters["$browser"] = st.sidebar.multiselect("Browser (선택적)", browsers, default=browsers)
 
-    st.subheader("④ 히트맵 형태 차트")
-    fig_heatmap = px.bar(x=labels, y=sales, color=sales, color_continuous_scale="Blues", labels={"x":"월","y":"매출","color":"매출"})
-    st.plotly_chart(fig_heatmap, use_container_width=True)
+mask = (df["ts"].dt.date >= pd.to_datetime(start).date()) & (df["ts"].dt.date <= pd.to_datetime(end).date())
+mask &= df["sns_type"].isin(sel_platforms)
+for c, vals in extra_filters.items():
+    if c in df.columns and len(vals) > 0:
+        mask &= df[c].isin(vals)
+f = df[mask].copy()
 
-# -----------------------------
-# 시계열차트 대시보드
-# -----------------------------
-def show_timeseries_dashboard():
-    labels = ["2023-01", "2023-02", "2023-03", "2023-04", "2023-05", "2023-06", "2023-07", "2023-08", "2023-09", "2023-10", "2023-11", "2023-12"]
-    productA = [272, 147, 217, 292, 423, 301, 334, 390, 355, 410, 398, 450]
-    productB = [86, 137, 120, 266, 138, 190, 178, 165, 200, 230, 210, 250]
-    productC = [158, 407, 235, 95, 403, 310, 280, 320, 360, 390, 400, 420]
-    productD = [222, 97, 167, 242, 373, 350, 330, 300, 310, 305, 320, 315]
-    productE = [147, 130, 148, 253, 99, 180, 200, 220, 210, 215, 205, 225]
+# ---------------------------
+# KPI & 병목
+# ---------------------------
+count_view  = (f["event"]=="Achievement Page View").sum()
+count_open  = (f["event"]=="Open SNS Share Popup").sum()
+count_share = (f["event"]=="Actual SNS Share").sum()
 
-    st.subheader("① 멀티 시리즈 꺾은선 그래프")
-    fig_multi = go.Figure()
-    for name, data in zip(['제품 A','제품 B','제품 C','제품 D','제품 E'],
-                          [productA, productB, productC, productD, productE]):
-        fig_multi.add_trace(go.Scatter(x=labels, y=data, mode='lines+markers', name=name))
-    st.plotly_chart(fig_multi, use_container_width=True)
+ctr  = (count_open / count_view) if count_view else 0
+cvr  = (count_share / count_open) if count_open else 0
+conv = (count_share / count_view) if count_view else 0
 
-    st.subheader("② 누적 영역 차트")
-    fig_stack = go.Figure()
-    for name, data in zip(['제품 A','제품 B','제품 C','제품 D','제품 E'],
-                          [productA, productB, productC, productD, productE]):
-        fig_stack.add_trace(go.Scatter(x=labels, y=data, stackgroup='one', name=name))
-    st.plotly_chart(fig_stack, use_container_width=True)
+drop_v2o = max(0, count_view - count_open)
+drop_o2s = max(0, count_open - count_share)
+bottleneck = "View → Open" if drop_v2o >= drop_o2s else "Open → Share"
+bottleneck_count = max(drop_v2o, drop_o2s)
 
-    st.subheader("③ 전월 대비 증감률 라인 차트")
-    def pct_change(arr):
-        return [0] + [round((arr[i] - arr[i-1]) / arr[i-1] * 100, 1) for i in range(1, len(arr))]
-    fig_growth = go.Figure()
-    for name, data in zip(['제품 A','제품 B','제품 C','제품 D','제품 E'],
-                          [productA, productB, productC, productD, productE]):
-        fig_growth.add_trace(go.Scatter(x=labels, y=pct_change(data), mode='lines+markers', name=name))
-    fig_growth.update_layout(yaxis_title="% 변화")
-    st.plotly_chart(fig_growth, use_container_width=True)
+# 헤더/KPI/배지
+now_kr = datetime.now(tz.gettz("Asia/Seoul")).strftime("%Y-%m-%d %H:%M:%S %Z")
+left, right = st.columns([3,2])
+with left:
+    st.markdown(f"<span class='small'>KST {now_kr}</span>", unsafe_allow_html=True)
+    st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+    st.markdown("<div class='block-title'>핵심 KPI</div>", unsafe_allow_html=True)
+    a,b,c = st.columns([1.2,1,1])
+    with a:
+        st.markdown(f"<div class='kpi'>{conv:.1%}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='kpi-sub'>Share Conversion (Share / View)</div>", unsafe_allow_html=True)
+    with b:
+        st.metric("Share CTR (Open / View)", f"{ctr:.1%}")
+    with c:
+        st.metric("Completion Rate (Share / Open)", f"{cvr:.1%}")
+with right:
+    st.markdown("<div class='block-title'>상태</div>", unsafe_allow_html=True)
+    if bottleneck_count > 0:
+        st.markdown(f"<span class='badge badge-danger'>🚨 Bottleneck: {bottleneck}</span>", unsafe_allow_html=True)
+    else:
+        st.markdown("<span class='badge badge-ok'>✅ Bottleneck 없음</span>", unsafe_allow_html=True)
+    st.caption("병목 단계에 '공유하면 어떤 효과?' 메시지/노출 타이밍 A/B 테스트 권장.")
 
-    st.subheader("④ Small Multiples (제품별 추세)")
-    cols = st.columns(2)
-    items = [('제품 A', productA), ('제품 B', productB), ('제품 C', productC), ('제품 D', productD), ('제품 E', productE)]
-    for i, (name, data) in enumerate(items):
-        with cols[i % 2]:
-            fig_small = go.Figure()
-            fig_small.add_trace(go.Scatter(x=labels, y=data, mode='lines+markers', name=name))
-            fig_small.update_layout(title=f"{name} 추세")
-            st.plotly_chart(fig_small, use_container_width=True)
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
 
-# -----------------------------
-# 파이차트 대시보드
-# -----------------------------
-def show_piechart_dashboard():
-    labels = ['제품 A', '제품 B', '제품 C', '제품 D', '제품 E']
-    sales = [3595, 2018, 3353, 2928, 2073]
-    colors = ['#ff6b6b','#4dabf7','#51cf66','#fcc419','#845ef7']
-    total_sales = sum(sales)
+# ---------------------------
+# 1) Sankey: 행동 시퀀스 흐름 (대형)
+# ---------------------------
+st.markdown("<div class='block-title'>1) 행동 시퀀스 (Sankey)</div>", unsafe_allow_html=True)
+SEQ = ["Achievement Page View","Certificate Select Click","Certificate Download",
+       "Open SNS Share Popup","Actual SNS Share"]
+seq_df = f[f["event"].isin(SEQ)].sort_values(["distinct_id","ts"])
+pairs = []
+for uid, g in seq_df.groupby("distinct_id"):
+    evs = g["event"].tolist()
+    for a, b in zip(evs[:-1], evs[1:]):
+        if a != b:
+            pairs.append((a,b))
+link_df = (pd.DataFrame(pairs, columns=["src","dst"]).value_counts()
+           .reset_index(name="value")) if pairs else pd.DataFrame(columns=["src","dst","value"])
+labels = sorted(set(link_df["src"]).union(set(link_df["dst"]))) if len(link_df) else SEQ
+idx = {lab:i for i,lab in enumerate(labels)}
+fig_sankey = go.Figure(data=[go.Sankey(
+    node=dict(label=labels,
+              color=["#A6CEE3","#B2DF8A","#FDBF6F","#FB9A99","#CAB2D6"],
+              pad=16, thickness=16),
+    link=dict(source=[idx[s] for s in link_df["src"]] if len(link_df) else [],
+              target=[idx[t] for t in link_df["dst"]] if len(link_df) else [],
+              value=link_df["value"] if len(link_df) else [],
+              color="rgba(0,166,166,0.30)")
+)])
+fig_sankey.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=420)
+st.plotly_chart(fig_sankey, use_container_width=True)
+st.caption("굵을수록 많이 발생한 경로. 노드/링크 hover로 전환 수 확인, 시나리오별 병목 파악.")
 
-    st.subheader("① 기본 파이 차트")
-    fig_pie = px.pie(names=labels, values=sales, color=labels, color_discrete_sequence=colors, hole=0)
-    fig_pie.update_traces(textinfo='percent+label')
-    st.plotly_chart(fig_pie, use_container_width=True)
+# ---------------------------
+# 2) 체류시간: Sharers vs Non-sharers (바이올린+스트립)
+# ---------------------------
+st.markdown("<div class='block-title'>2) 체류시간(추정) 분포: Sharers vs Non-sharers</div>", unsafe_allow_html=True)
+sharer_ids = set(f.loc[f["event"]=="Actual SNS Share","distinct_id"].unique().tolist())
+pv = f[f["event"]=="Achievement Page View"][["distinct_id","dwell_sec"]].copy()
+pv["group"] = pv["distinct_id"].apply(lambda x: "Sharers" if x in sharer_ids else "Non-sharers")
+fig_violin = px.violin(pv, x="group", y="dwell_sec", box=True, points="all",
+                       color="group", color_discrete_sequence=["#00A6A6","#9CA3AF"])
+fig_violin.update_layout(height=380, margin=dict(l=10,r=10,t=10,b=10))
+fig_violin.update_yaxes(title="Estimated Dwell Time on Page (sec)")
+st.plotly_chart(fig_violin, use_container_width=True)
+st.caption("원본 duration_seconds가 없어, 다음 이벤트까지의 시간차(0~600초)를 체류시간 추정치로 사용.")
 
-    st.subheader("② 도넛 차트 (총 매출 표시)")
-    fig_donut = px.pie(names=labels, values=sales, color=labels, color_discrete_sequence=colors, hole=0.6)
-    fig_donut.update_traces(textinfo='percent+label', hovertemplate='%{label}: %{value} (%{percent})')
-    fig_donut.update_layout(title=f"총 매출: {total_sales:,}")
-    st.plotly_chart(fig_donut, use_container_width=True)
+# ---------------------------
+# 3) 플랫폼 효율 보드 (정규화 + 95% CI)
+# ---------------------------
+st.markdown("<div class='block-title'>3) 플랫폼 효율 보드 (정규화 + 신뢰구간)</div>", unsafe_allow_html=True)
+sub = f[f["event"].isin(["Open SNS Share Popup","Actual SNS Share"])].copy()
+sub["event_stage"] = sub["event"].map({"Open SNS Share Popup":"popup","Actual SNS Share":"complete"})
 
-    st.subheader("③ 누적 기여도 바 차트")
-    sorted_data = sorted(zip(labels, sales, colors), key=lambda x: x[1], reverse=True)
-    fig_bar = go.Figure([go.Bar(x=[x[0] for x in sorted_data], y=[x[1] for x in sorted_data], marker_color=[x[2] for x in sorted_data])])
-    fig_bar.update_layout(yaxis_title="매출")
-    st.plotly_chart(fig_bar, use_container_width=True)
+# 분포(정규화)
+dist = (sub.groupby(["event_stage","sns_type"]).size()
+          .groupby(level=0).apply(lambda s: 100*s/s.sum()).reset_index(name="pct"))
+fig_dist = px.bar(dist, x="sns_type", y="pct", color="event_stage",
+                  barmode="group", color_discrete_sequence=["#6EE7E7","#00A6A6"],
+                  labels={"pct":"비중(%)","sns_type":"플랫폼","event_stage":"단계"})
+fig_dist.update_layout(height=340, margin=dict(l=10,r=10,t=10,b=10))
+st.plotly_chart(fig_dist, use_container_width=True)
 
-    st.subheader("④ 트리맵")
-    fig_treemap = px.treemap(names=labels, parents=["" for _ in labels], values=sales, color=labels, color_discrete_sequence=colors)
-    st.plotly_chart(fig_treemap, use_container_width=True)
+# CVR + Wilson CI
+open_by = sub[sub["event_stage"]=="popup"]["sns_type"].value_counts()
+comp_by = sub[sub["event_stage"]=="complete"]["sns_type"].value_counts()
+plats = sorted(set(open_by.index).union(set(comp_by.index)))
+rows=[]
+for p_name in plats:
+    o = int(open_by.get(p_name,0)); c = int(comp_by.get(p_name,0))
+    cvr = c/o if o>0 else 0.0
+    lo, hi = wilson_ci(c, o) if o>0 else (0.0,0.0)
+    rows.append({"sns_type":p_name,"open":o,"complete":c,"CVR":cvr,"CI_low":lo,"CI_high":hi})
+cvr_df = pd.DataFrame(rows).sort_values("CVR", ascending=False)
 
-# -----------------------------
-# 산점도 대시보드
-# -----------------------------
-def show_scatter_dashboard():
-    sales = [272, 147, 217, 292, 423, 301, 334, 390, 355, 410, 398, 450]
-    costs = [149, 227, 293, 335, 197, 280, 300, 310, 250, 270, 260, 290]
-    profits = [s - c for s, c in zip(sales, costs)]
-    avg_cost = sum(costs) / len(costs)
-    avg_sales = sum(sales) / len(sales)
+fig_cvr = go.Figure()
+fig_cvr.add_trace(go.Bar(
+    x=cvr_df["sns_type"], y=cvr_df["CVR"], name="Completion Rate", marker_color="#00A6A6",
+    hovertemplate="플랫폼=%{x}<br>CVR=%{y:.1%}<br>Open=%{customdata[0]} / Complete=%{customdata[1]}<extra></extra>",
+    customdata=cvr_df[["open","complete"]].values
+))
+fig_cvr.add_trace(go.Scatter(x=cvr_df["sns_type"], y=cvr_df["CI_high"], mode="lines",
+                             line=dict(width=0), showlegend=False, hoverinfo="skip"))
+fig_cvr.add_trace(go.Scatter(x=cvr_df["sns_type"], y=cvr_df["CI_low"], mode="lines", fill="tonexty",
+                             line=dict(width=0), fillcolor="rgba(0,166,166,0.15)", name="95% CI", hoverinfo="skip"))
+fig_cvr.update_yaxes(tickformat=".0%")
+fig_cvr.update_layout(height=360, margin=dict(l=10,r=10,t=10,b=10))
+st.plotly_chart(fig_cvr, use_container_width=True)
 
-    st.subheader("① 기본 산점도")
-    fig_basic = px.scatter(x=costs, y=sales, labels={'x': '비용', 'y': '매출'})
-    st.plotly_chart(fig_basic, use_container_width=True)
+# 인사이트 배지
+if len(cvr_df) > 0:
+    top = cvr_df.iloc[0]; low = cvr_df.iloc[-1]
+    st.markdown(
+        f"<span class='badge badge-ok'>👍 High CVR: {top['sns_type']} ({top['CVR']:.1%})</span> "
+        f"<span class='badge badge-danger'>⚠️ Low CVR: {low['sns_type']} ({low['CVR']:.1%})</span>",
+        unsafe_allow_html=True
+    )
+    st.caption("플랫폼별 '시도(팝업)→완료' 효율을 정규화하여 비교. CI는 샘플 수 불확실성 반영.")
 
-    st.subheader("② 회귀선 포함 산점도")
-    fig_reg = px.scatter(x=costs, y=sales, labels={'x': '비용', 'y': '매출'}, trendline="ols")
-    st.plotly_chart(fig_reg, use_container_width=True)
-
-    st.subheader("③ 수익성 버블 차트")
-    fig_bubble = px.scatter(x=costs, y=sales, size=[abs(p) for p in profits], color=["수익" if p >= 0 else "손실" for p in profits], labels={'x': '비용', 'y': '매출'})
-    st.plotly_chart(fig_bubble, use_container_width=True)
-
-    st.subheader("④ 사분면 분석 차트")
-    categories = []
-    for s, c in zip(sales, costs):
-        if s >= avg_sales and c < avg_cost:
-            categories.append("스타 제품")
-        elif s >= avg_sales and c >= avg_cost:
-            categories.append("프리미엄 전략")
-        elif s < avg_sales and c < avg_cost:
-            categories.append("니치 시장")
-        else:
-            categories.append("개선 필요")
-    fig_quad = px.scatter(x=costs, y=sales, color=categories, labels={'x': '비용', 'y': '매출'})
-    fig_quad.add_shape(type="line", x0=avg_cost, x1=avg_cost, y0=min(sales), y1=max(sales), line=dict(dash="dash"))
-    fig_quad.add_shape(type="line", x0=min(costs), x1=max(costs), y0=avg_sales, y1=avg_sales, line=dict(dash="dash"))
-    st.plotly_chart(fig_quad, use_container_width=True)
-
-# -----------------------------
-# 파레토차트 대시보드
-# -----------------------------
-def show_pareto_dashboard():
-    departments = ['기획부', '마케팅부', '영업부', '인사부', '개발부']
-    training_hours = [87, 87, 84, 67, 64]
-    sales = [954, 923, 559, 477, 209]
-
-    st.subheader("① 파레토 차트")
-    sorted_data = sorted(zip(departments, sales), key=lambda x: x[1], reverse=True)
-    sorted_depts = [x[0] for x in sorted_data]
-    sorted_sales = [x[1] for x in sorted_data]
-    total_sales = sum(sorted_sales)
-    cumulative = []
-    cum_sum = 0
-    for val in sorted_sales:
-        cum_sum += val
-        cumulative.append(round(cum_sum / total_sales * 100, 1))
-    fig_pareto = go.Figure()
-    fig_pareto.add_trace(go.Bar(x=sorted_depts, y=sorted_sales, name="매출", yaxis="y"))
-    fig_pareto.add_trace(go.Scatter(x=sorted_depts, y=cumulative, name="누적 기여율", mode="lines+markers", yaxis="y2"))
-    fig_pareto.update_layout(yaxis=dict(title="매출"), yaxis2=dict(title="누적 기여율(%)", overlaying="y", side="right", range=[0, 100]))
-    st.plotly_chart(fig_pareto, use_container_width=True)
-
-    st.subheader("② 교육 훈련 시간 vs 매출")
-    fig_scatter = px.scatter(x=training_hours, y=sales, text=departments, labels={'x': '교육 훈련 시간', 'y': '매출'})
-    fig_scatter.update_traces(textposition='top center')
-    st.plotly_chart(fig_scatter, use_container_width=True)
-
-    st.subheader("③ 단위 훈련 시간당 매출")
-    efficiency = [round(s / t, 2) for s, t in zip(sales, training_hours)]
-    fig_eff = go.Figure([go.Bar(x=departments, y=efficiency)])
-    fig_eff.update_layout(yaxis_title="매출/시간")
-    st.plotly_chart(fig_eff, use_container_width=True)
-
-# -----------------------------
-# 메인 탭 (정확히 5개, 시트명과 동일)
-# -----------------------------
-st.title("엑셀 시트별 대시보드")
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["바차트_히스토그램", "시계열차트", "파이차트", "산점도", "파레토차트"])
-
-with tab1:
-    show_bar_histogram_dashboard()
-with tab2:
-    show_timeseries_dashboard()
-with tab3:
-    show_piechart_dashboard()
-with tab4:
-    show_scatter_dashboard()
-with tab5:
-    show_pareto_dashboard()
+st.markdown("<hr class='soft'/>", unsafe_allow_html=True)
+st.markdown("**Tip**: Sankey 링크가 굵은 경로에 메시지/노출 타이밍 실험을 배치하고, CVR 상위 플랫폼에 리소스를 집중하세요.")
